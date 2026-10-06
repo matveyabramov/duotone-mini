@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <base href="/">
+  <title>DUOTONE MINI MIDI validation</title>
+  <script src="assets/vendor/Tone.js"></script>
+  <script src="assets/vendor/Midi.js"></script>
+  <script src="midi-import.js"></script>
+</head>
+<body>
+  <h1>DUOTONE MINI MIDI validation</h1>
+  <button id="run-midi" disabled>Run MIDI checks</button>
+  <pre id="results">Loading the instrument…</pre>
+  <div id="fixture" hidden></div>
+  <script>
+    const results = document.getElementById('results');
+    let uncaught = 0;
+    window.addEventListener('error', () => uncaught++);
+    window.addEventListener('unhandledrejection', () => uncaught++);
+    const check = (condition, message) => {
+      if (!condition) throw new Error(message);
+      results.textContent += `PASS: ${message}\n`;
+    };
+    const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+    async function file(name) {
+      const data = await (await fetch(`tests/fixtures/${name}`)).arrayBuffer();
+      return new File([data], name);
+    }
+    function disposeGraph() {
+      stopTransport();
+      for (const voice of drumVoices) voice?.sampler?.dispose();
+      drumVoices.length = 0;
+      if (audio) for (const node of Object.values(audio)) node.dispose();
+      audio = null;
+    }
+    async function renderMidi() {
+      const notes = [], ends = [], hits = [];
+      const originalMidi = playMidiEvent, originalDrum = playDrum;
+      playMidiEvent = (event, time, generation) => {
+        if (event.on) notes.push({ midi: event.note.midi, time, velocity: event.note.velocity });
+        if (!event.on) ends.push(event.note.id);
+        originalMidi(event, time, generation);
+      };
+      playDrum = (index, time, velocity, generation) => {
+        hits.push(index); originalDrum(index, time, velocity, generation);
+      };
+      try {
+        const buffer = await Tone.Offline(async () => {
+          await startTransport();
+          await startTransport();
+          audio.fxLevel.gain.value = 0;
+        }, 1.9, 1, 44100);
+        const samples = buffer.get().getChannelData(0);
+        check(samples.some(sample => Math.abs(sample) > .0001), 'MIDI plus drums renders real audio');
+        check(notes.length === 5, 'repeated Play schedules the selected five-note track only once');
+        check(notes.some(note => note.midi === 84), 'out-of-range C6 is scheduled through Voice A');
+        check(notes.every(note => Math.abs(note.velocity - importedMidi.notes[0].velocity) < .00001), 'MIDI velocity reaches the synth');
+        check(Math.abs(notes.find(note => note.midi === 67).time - 120 / importedMidi.tempo) < .00001, 'MIDI ticks follow the initial tempo, ignoring later tempo changes');
+        check(hits.includes(0) && hits.includes(1) && hits.includes(3), 'the existing drum groove shares MIDI transport');
+        check(ends.length === 5 && midiPitchCounts.size === 0, 'every MIDI note ends at its scheduled duration regardless of Hold');
+        return samples.slice();
+      } finally {
+        playMidiEvent = originalMidi; playDrum = originalDrum; disposeGraph();
+      }
+    }
+    async function checkLatch() {
+      stopTransport(); setHold(false);
+      await noteOn('hold:normal', 12); noteOff('hold:normal');
+      check(!soundingNotes.has(60) && piano.children[12].getAttribute('aria-pressed') === 'false', 'Hold OFF releases a normal manual press');
+      setHold(true);
+      for (const index of [12, 16, 19]) {
+        await noteOn(`hold:${index}`, index); noteOff(`hold:${index}`);
+      }
+      check(latchedNotes.size === 3 && soundingNotes.size === 3, 'Hold latches a C4/E4/G4 chord after physical release');
+      await noteOn('hold:toggle-c', 12); noteOff('hold:toggle-c');
+      check(!latchedNotes.has(60) && latchedNotes.has(64) && latchedNotes.has(67) && piano.children[12].getAttribute('aria-pressed') === 'false', 'pressing C4 again releases only C4');
+      setHold(false);
+      check(latchedNotes.size === 0 && soundingNotes.size === 0 && document.querySelectorAll('.piano-key.is-active').length === 0, 'Hold OFF clears all remaining manual latches');
+      setHold(true);
+      await noteOn('hold:old-octave', 12); noteOff('hold:old-octave');
+      changeOctave(1);
+      await noteOn('hold:new-octave', 16); noteOff('hold:new-octave');
+      check(latchedNotes.has(60) && latchedNotes.has(76) && piano.children[0].getAttribute('aria-pressed') === 'true', 'old C4 stays latched and new notes use the new octave');
+      await noteOn('hold:same-pitch', 0); noteOff('hold:same-pitch');
+      check(!latchedNotes.has(60) && latchedNotes.has(76), 'the new keyboard mapping can toggle the same old musical pitch');
+      await triggerDrum(0);
+      await pause(150);
+      check(!padStates[0].flashing && latchedNotes.size === 1, 'one-shot Kick returns to neutral and ignores Hold');
+      stopTransport();
+      check(hold && latchedNotes.size === 0 && soundingNotes.size === 0 && document.querySelectorAll('.piano-key.is-active,.pad.is-active').length === 0, 'Stop is a panic release and leaves Hold enabled');
+      changeOctave(-1);
+      for (let cycle = 0; cycle < 4; cycle++) {
+        await startTransport();
+        const currentSequence = sequence, currentPart = midiPart;
+        await startTransport(); await startTransport();
+        await pause(160);
+        check(sequence === currentSequence && midiPart === currentPart && midiPitchCounts.has(72), `restart ${cycle + 1} begins MIDI and creates no duplicate schedules`);
+        await noteOn(`hold:live:${cycle}`, 12); noteOff(`hold:live:${cycle}`);
+        await triggerDrum(2);
+        check(latchedNotes.has(60) && midiPitchCounts.has(72) && Tone.getTransport().state === 'started', 'manual latches, MIDI, and manual pads coexist with the groove');
+        stopTransport();
+        check(sequence === null && midiPart === null && latchedNotes.size === 0 && midiVisualNotes.size === 0 && document.getElementById('play').getAttribute('aria-pressed') === 'false', 'Stop returns Play and all note ownership to neutral');
+      }
+      setHold(false);
+      await pause(1600);
+      check(audio.synth.activeVoices === 0, 'no synth voices remain stuck after the final panic release');
+    }
+    async function runChecks() {
+      document.getElementById('run-midi').disabled = true;
+      results.textContent = '';
+      const originalStart = Tone.start;
+      try {
+        await originalStart();
+        check(await importMidiFile(await file('melody.mid')), 'valid multi-track MIDI imports');
+        check(importedMidi.trackName === 'Lead' && importedMidi.notes.length === 5, 'largest melodic track wins over a larger percussion track');
+        check(Math.abs(bpm - 132) < .001, 'initial MIDI tempo updates BPM');
+        Tone.start = () => Promise.resolve();
+        const normalMidi = await renderMidi();
+        setHold(true);
+        const heldMidi = await renderMidi();
+        check(normalMidi.every((sample, index) => Math.abs(sample - heldMidi[index]) < 1e-7), 'Hold ON and OFF render identical imported MIDI and drum audio');
+        setHold(false);
+        Tone.start = originalStart;
+        await startTransport();
+        await pause(200);
+        await noteOn('validation:shared', 12);
+        await pause(600);
+        check(!midiPitchCounts.has(60) && soundingNotes.has(60) && document.querySelectorAll('.piano-key.is-active').length >= 1, 'manual C4 remains held after overlapping MIDI C4 notes end');
+        noteOff('validation:shared');
+        await pause(800);
+        check(midiVisualNotes.size === 0 && document.querySelectorAll('.piano-key.is-active').length === 0, 'MIDI note endings release every visual key');
+        stopTransport();
+        check(await importMidiFile(await file('sustained.mid')), 'second MIDI replaces the first');
+        await startTransport();
+        await pause(250);
+        check(document.querySelectorAll('.piano-key.is-active').length === 1, 'visible MIDI note highlights its piano key');
+        check(document.getElementById('play').getAttribute('aria-pressed') === 'true' && Tone.getTransport().state === 'started', 'Play state follows the running Transport');
+        await noteOn('validation:manual', 12);
+        stopDrums();
+        await triggerDrum(2);
+        check(drumVoices[2].state === 'ready', 'manual pad remains playable over MIDI');
+        changeOctave(1);
+        check(midiPitchCounts.has(60) && piano.children[0].getAttribute('aria-pressed') === 'true' && piano.children[12].getAttribute('aria-pressed') === 'false', 'octave switching preserves MIDI C4 and highlights its newly displayed key');
+        changeOctave(-1);
+        check(document.querySelectorAll('.piano-key.is-active').length === 1, 'MIDI visualization follows the displayed range independently');
+        stopTransport();
+        check(document.querySelectorAll('.piano-key.is-active,.pad.is-active').length === 0, 'Stop clears MIDI and pad visual states');
+        check(midiPart === null && sequence === null && Tone.getTransport().state === 'stopped', 'Stop disposes both schedules');
+        check(document.getElementById('play').getAttribute('aria-pressed') === 'false' && !document.getElementById('stop').hasAttribute('aria-pressed'), 'Play is neutral and Stop never latches');
+        await startTransport(); await pause(200);
+        check(midiPitchCounts.has(60), 'Play after Stop restarts from the first MIDI note');
+        // External stopping must also synchronize Play and dispose the schedules.
+        Tone.getTransport().stop(Tone.immediate()); await pause(150);
+        check(document.getElementById('play').getAttribute('aria-pressed') === 'false' && midiPart === null, 'external Transport.stop clears playback and the Play state');
+        const previousTempo = bpm;
+        check(await importMidiFile(await file('replacement.midi')), 'a replacement file imports without duplicate events');
+        check(importedMidi.notes.length === 2 && bpm === previousTempo, 'missing tempo preserves current BPM');
+        const retained = importedMidi;
+        check(!await importMidiFile(await file('invalid.mid')) && importedMidi === retained, 'invalid import is reported without losing the previous melody');
+        check(!await importMidiFile(await file('truncated.mid')), 'truncated files fail gracefully');
+        await noteOn('validation:stopped', 0); noteOff('validation:stopped');
+        await triggerDrum(0);
+        check(soundingNotes.size === 0 && drumVoices[0].state === 'ready', 'manual synth and pads work while stopped');
+        await checkLatch();
+        check(uncaught === 0, 'no uncaught browser errors or unhandled rejections');
+        results.textContent += '\nALL MIDI CHECKS PASSED\n';
+      } catch (error) {
+        results.textContent += `FAIL: ${error.message}\n`;
+      } finally {
+        Tone.start = originalStart; disposeGraph();
+        document.getElementById('run-midi').disabled = false;
+      }
+    }
+    (async () => {
+      const markup = await (await fetch('index.html')).text();
+      document.getElementById('fixture').append(new DOMParser().parseFromString(markup, 'text/html').querySelector('main'));
+      const script = document.createElement('script'); script.src = 'script.js';
+      script.onload = () => {
+        results.textContent = 'Ready. Checks render offline audio and briefly exercise live playback.\n';
+        document.getElementById('run-midi').disabled = false;
+        document.getElementById('run-midi').addEventListener('click', runChecks);
+      };
+      document.body.append(script);
+    })();
+  </script>
+</body>
+</html>

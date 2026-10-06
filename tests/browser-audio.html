@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <base href="/">
+  <title>DUOTONE MINI audio validation</title>
+  <script src="assets/vendor/Tone.js"></script>
+  <script src="assets/vendor/Midi.js"></script>
+  <script src="midi-import.js"></script>
+</head>
+<body>
+  <h1>DUOTONE MINI audio validation</h1>
+  <button id="run-tests" disabled>Run audio checks</button>
+  <pre id="results">Loading the production instrument…</pre>
+  <div id="fixture" hidden></div>
+  <script>
+    // Run real Tone.js nodes offline, using the production graph and sample loader.
+    // This fixture has no effect on the normal instrument page.
+    const results = document.getElementById('results');
+    const check = (condition, message) => {
+      if (!condition) throw new Error(message);
+      results.textContent += `PASS: ${message}\n`;
+    };
+    let uncaughtErrors = 0;
+    window.addEventListener('error', () => uncaughtErrors++);
+    window.addEventListener('unhandledrejection', () => uncaughtErrors++);
+    function rms(buffer, from = 0, to = buffer.length) {
+      let sum = 0;
+      for (let i = from; i < to; i++) sum += buffer[i] ** 2;
+      return Math.sqrt(sum / (to - from));
+    }
+    function disposeGraph() {
+      stopTransport();
+      for (const voice of drumVoices) voice?.sampler?.dispose();
+      drumVoices.length = 0;
+      if (audio) for (const node of Object.values(audio)) node.dispose();
+      audio = null;
+      audioStarting = null;
+    }
+    async function render({ pad = null, melody = false, synthGain = .7, drumGain = .5, masterGain = .8, fxGain = 0, repeats = false } = {}) {
+      const buffer = await Tone.Offline(async () => {
+        await ensureAudio();
+        audio.synthLevel.gain.value = synthGain;
+        audio.drumLevel.gain.value = drumGain;
+        audio.master.gain.value = masterGain;
+        audio.fxLevel.gain.value = fxGain;
+        if (melody) audio.synth.triggerAttackRelease('C4', .25, 0, .8);
+        if (pad !== null) {
+          const voice = loadDrum(pad);
+          check(await voice.ready, `${drumSamples[pad].name} loads and decodes`);
+          voice.sampler.triggerAttack(drumSamples[pad].note, 0, .9);
+          if (repeats) {
+            voice.sampler.triggerAttack(drumSamples[pad].note, .1, .9);
+            voice.sampler.triggerAttack(drumSamples[pad].note, .2, .9);
+          }
+        }
+      }, 1.5, 1, 44100);
+      const samples = buffer.get().getChannelData(0).slice();
+      disposeGraph();
+      return samples;
+    }
+    async function renderGroove(tempo, changeTempo = false) {
+      const hits = [];
+      const originalHit = playDrum;
+      playDrum = (index, time, velocity, generation) => {
+        hits.push({ index, time });
+        originalHit(index, time, velocity, generation);
+      };
+      let samples;
+      try {
+        const buffer = await Tone.Offline(async () => {
+          setBpm(tempo);
+          await startTransport();
+          check(transportState === 'playing', `groove starts at ${tempo} BPM`);
+          await startTransport();
+          audio.fxLevel.gain.value = 0;
+          if (changeTempo) {
+            // Offline restores the global context before rendering callbacks.
+            // Retain this render's transport rather than looking up the live one.
+            const offlineTransport = Tone.getTransport();
+            offlineTransport.scheduleOnce(() => { offlineTransport.bpm.value = 180; }, .75);
+          }
+          audio.synth.triggerAttackRelease('C4', .25, .1, .8);
+          const manualVoice = loadDrum(2);
+          check(await manualVoice.ready, 'manual clap loads alongside the groove');
+          playDrum(2, .4, .7);
+        }, 1.99, 1, 44100);
+        samples = buffer.get().getChannelData(0).slice();
+      } finally {
+        playDrum = originalHit;
+        disposeGraph();
+      }
+      const hats = hits.filter(hit => hit.index === 3);
+      check(rms(samples) > .0001, `groove plus live voices renders audio at ${tempo} BPM`);
+      if (!changeTempo) check(hats.length === (tempo === 120 ? 8 : 12), `one sequence produces the expected hat count at ${tempo} BPM`);
+      check(Math.abs(hats[1].time - hats[0].time - 30 / tempo) < .00001, `Transport schedules eighth notes at ${tempo} BPM`);
+      if (changeTempo) check(Math.abs(hats.at(-1).time - hats.at(-2).time - 1 / 6) < .00001, 'changing BPM speeds up an already running groove');
+      check(hits.some(hit => hit.index === 0) && hits.some(hit => hit.index === 1), 'kick and snare use the existing samplers');
+    }
+    async function checkLiveTempo() {
+      const hits = [];
+      const originalHit = playDrum;
+      playDrum = (index, time, velocity, generation) => {
+        if (index === 3) hits.push(time);
+        originalHit(index, time, velocity, generation);
+      };
+      try {
+        setBpm(120);
+        await startTransport();
+        await new Promise(resolve => setTimeout(resolve, 800));
+        setBpm(180);
+        await new Promise(resolve => setTimeout(resolve, 900));
+        check(Math.abs(hits[1] - hits[0] - .25) < .00001 && Math.abs(hits.at(-1) - hits.at(-2) - 1 / 6) < .00001, 'BPM editing changes the running live Transport timing');
+        stopTransport();
+        const stoppedCount = hits.length;
+        await new Promise(resolve => setTimeout(resolve, 350));
+        check(hits.length === stoppedCount && sequence === null && transportState === 'stopped', 'live Stop prevents further scheduled hits');
+        check(padStates.every(state => !state.flashing), 'all pads return to neutral after live Stop');
+      } finally {
+        playDrum = originalHit;
+        disposeGraph();
+      }
+    }
+    async function runChecks() {
+      document.getElementById('run-tests').disabled = true;
+      results.textContent = '';
+      const originalStart = Tone.start;
+      await originalStart();
+      // Offline contexts cannot resume. The normal browser startup is tested separately.
+      Tone.start = () => Promise.resolve();
+      try {
+        const fingerprints = new Set();
+        for (let pad = 0; pad < drumSamples.length; pad++) {
+          const data = await render({ pad });
+          check(rms(data) > .0001, `${drumSamples[pad].name} produces a non-silent waveform`);
+          let hash = 2166136261;
+          for (const value of data) hash = Math.imul(hash ^ Math.round(value * 32767), 16777619) >>> 0;
+          fingerprints.add(hash);
+        }
+        check(fingerprints.size === 8, 'all eight rendered drum sounds are distinct');
+        const drum = await render({ pad: 0 });
+        const drumWithSynthMuted = await render({ pad: 0, synthGain: 0 });
+        check(Math.abs(rms(drum) - rms(drumWithSynthMuted)) < 1e-7, 'Synth fader does not change drums');
+        const quietDrum = await render({ pad: 0, drumGain: .25 });
+        check(Math.abs(rms(quietDrum) / rms(drum) - .5) < .0001, 'Drums gain scales only its audio path');
+        const mutedDrum = await render({ pad: 0, drumGain: 0 });
+        check(rms(mutedDrum) === 0, 'Drums fader fully mutes Voice B');
+        const synth = await render({ melody: true });
+        const synthWithDrumsMuted = await render({ melody: true, drumGain: 0 });
+        check(rms(synth) > .0001 && Math.abs(rms(synth) - rms(synthWithDrumsMuted)) < 1e-7, 'Voice A still sounds and Drums fader does not change it');
+        const wetSynth = await render({ melody: true, fxGain: .7 });
+        check(wetSynth.some((value, index) => Math.abs(value - synth[index]) > .0001), 'FX fader changes the synth wet effects');
+        const wetDrum = await render({ pad: 0, fxGain: .7 });
+        check(Math.abs(rms(wetDrum) - rms(drum)) < 1e-7, 'FX fader does not affect the independent drum path');
+        const both = await render({ pad: 0, melody: true });
+        const halfMaster = await render({ pad: 0, melody: true, masterGain: .4 });
+        check(Math.abs(rms(halfMaster) / rms(both) - .5) < .0001, 'Master scales the combined voices');
+        check(rms(await render({ pad: 0, melody: true, masterGain: 0 })) === 0, 'Master fully mutes both voices');
+        const repeated = await render({ pad: 0, repeats: true });
+        check(rms(repeated, 8820, 11025) > .0001, 'rapid retriggering produces the third kick');
+        await renderGroove(120);
+        await renderGroove(180);
+        await renderGroove(120, true);
+        // One intentional failed resource request verifies graceful missing-file handling.
+        await ensureAudio();
+        const originalFile = drumSamples[0].file;
+        drumSamples[0].file = 'missing-validation-sample.WAV';
+        await triggerDrum(0);
+        check(drumVoices[0].state === 'failed' && readout.textContent.includes('SAMPLE UNAVAILABLE'), 'a missing sample produces useful OLED feedback');
+        drumSamples[0].file = originalFile;
+        await triggerDrum(0);
+        check(drumVoices[0].state === 'ready', 'pressing again retries and recovers a failed pad');
+        Tone.start = originalStart;
+        disposeGraph();
+        await checkLiveTempo();
+        check(uncaughtErrors === 0, 'no uncaught errors or unhandled rejections');
+        results.textContent += '\nALL AUDIO CHECKS PASSED\n';
+      } catch (error) {
+        results.textContent += `FAIL: ${error.message}\n`;
+      } finally {
+        disposeGraph();
+        Tone.start = originalStart;
+        document.getElementById('run-tests').disabled = false;
+      }
+    }
+    (async () => {
+      const markup = await (await fetch('index.html')).text();
+      document.getElementById('fixture').append(new DOMParser().parseFromString(markup, 'text/html').querySelector('main'));
+      const script = document.createElement('script');
+      script.src = 'script.js';
+      script.onload = () => {
+        results.textContent = 'Ready. These checks render actual Tone.js audio without playing it aloud.\n';
+        document.getElementById('run-tests').disabled = false;
+        document.getElementById('run-tests').addEventListener('click', runChecks);
+      };
+      document.body.append(script);
+    })();
+  </script>
+</body>
+</html>

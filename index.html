@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#e5e7e3">
+  <title>DUOTONE MINI</title>
+  <link rel="stylesheet" href="reset.css">
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/vendor/Tone.js" defer></script>
+  <script src="assets/vendor/Midi.js" defer></script>
+  <script src="midi-import.js" defer></script>
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <main class="instrument" aria-label="DUOTONE MINI musical instrument">
+    <header class="utility-panel">
+      <div class="identity">
+        <h1><span class="duotone-mark" aria-hidden="true"><i></i><i></i></span>DUOTONE MINI</h1>
+        <p>TWO VOICES. ONE INSTRUMENT.</p>
+      </div>
+      <div class="oled-bezel">
+        <div class="oled">
+          <div class="oled-meta"><span id="oled-voice">VOICE A · POLY SYNTH</span><span>PARAM / NOTE / IMPORT</span></div>
+          <p class="preset" id="oled-title">Glass Horizon</p>
+          <div class="oled-bottom"><output id="readout" aria-live="polite">CUTOFF 2.40k · READY</output><img src="assets/ui/waveform.svg" alt="" width="64" height="17"></div>
+        </div>
+      </div>
+      <div class="status"><label for="bpm">BPM</label><input id="bpm" type="number" min="50" max="200" step="1" value="120.0" aria-label="Tempo in beats per minute" title="Edit tempo or use arrow keys (50–200 BPM)"></div>
+      <div class="status"><span>OCTAVE</span><output id="octave">±0</output></div>
+      <div class="import-area"><span>MIDI / AUDIO</span><button id="import" class="import-button" title="Import a MIDI melody (.mid or .midi)"><img src="assets/ui/indicator.svg" width="6" height="6" alt="">IMPORT</button><input id="midi-file" type="file" accept=".mid,.midi" hidden aria-label="Choose a MIDI file"></div>
+    </header>
+    <div class="panel-seam"></div>
+    <div class="control-deck">
+      <section class="performance" aria-labelledby="control-heading">
+        <div class="section-label"><h2 id="control-heading">CONTROL</h2><p>PERFORMANCE</p></div>
+        <div class="utility-buttons"><button id="hold" aria-pressed="false" title="Latch manual notes; press the same pitch again to release it">Hold</button><div class="octave-buttons"><button id="oct-down" aria-label="Octave down">Oct-</button><button id="oct-up" aria-label="Octave up">Oct+</button></div></div>
+        <div class="panel-seam"></div>
+        <p class="transport-label">TRANSPORT</p>
+        <div class="transport"><div><button id="play" class="play-button" aria-pressed="false" aria-label="Play" title="Start the four-beat drum groove"><i class="play-symbol" aria-hidden="true"></i></button><span>Play</span></div><div><button id="stop" aria-label="Stop" title="Stop the groove and release notes; keep instrument settings"><i class="stop-symbol"></i></button><span>Stop</span></div></div>
+      </section>
+      <section class="synth-controls" aria-labelledby="synth-heading"><div class="section-label"><h2 id="synth-heading">VOICE A — SYNTH</h2><p>KEYBOARD MELODY</p></div><div id="knobs" class="knob-grid"></div></section>
+      <section class="sampler-controls" aria-labelledby="sampler-heading"><div class="section-label"><h2 id="sampler-heading">VOICE B — SAMPLER / DRUM VOICE</h2><p>PADS · SECONDARY LAYER</p></div><div id="pads" class="pad-grid"></div><div class="sampler-status"><span>KIT 08 · STUDIO 909</span><span>ONE SHOT</span></div></section>
+      <section class="mixer" aria-labelledby="mix-heading"><div class="section-label"><h2 id="mix-heading">VOICE MIX</h2><p>LEVELS + EFFECTS</p></div><div id="faders" class="faders"></div></section>
+    </div>
+    <section class="melody-keyboard" aria-label="Piano keyboard">
+      <div class="keyboard-info"><div><img src="assets/ui/voice-light.svg" alt="" width="5" height="5"><strong>VOICE A — SYNTH</strong><span>/ KEYBOARD MELODY</span></div><span id="keyboard-range">25 KEYS · C3–C5</span></div>
+      <div class="keyboard-scroll"><div id="piano" class="piano"></div></div>
+    </section>
+  </main>
+</body>
+</html>
