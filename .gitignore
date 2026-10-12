@@ -1,0 +1,10 @@
+/presentation/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+/.vscode/
+/AGENTS.md

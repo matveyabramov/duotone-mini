@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <base href="/">
+  <base href="../">
   <title>DUOTONE MINI MIDI validation</title>
   <script src="assets/vendor/Tone.js"></script>
   <script src="assets/vendor/Midi.js"></script>
@@ -22,7 +22,14 @@
       if (!condition) throw new Error(message);
       results.textContent += `PASS: ${message}\n`;
     };
-    const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+    // Audio devices/contexts can advance slower than wall time; inspect musical time.
+    async function pause(ms) {
+      const context = Tone.getContext(), start = context.immediate(), deadline = performance.now() + ms + 15000;
+      while (context.immediate() - start < ms / 1000) {
+        if (performance.now() > deadline) throw Error('Audio clock did not advance; keep this test tab active');
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+    }
     async function file(name) {
       const data = await (await fetch(`tests/fixtures/${name}`)).arrayBuffer();
       return new File([data], name);
@@ -119,14 +126,22 @@
         const normalMidi = await renderMidi();
         setHold(true);
         const heldMidi = await renderMidi();
-        check(normalMidi.every((sample, index) => Math.abs(sample - heldMidi[index]) < 1e-7), 'Hold ON and OFF render identical imported MIDI and drum audio');
+        const differences = normalMidi.map((sample,index) => sample-heldMidi[index]);
+        const differencePeak = differences.reduce((max,value) => Math.max(max,Math.abs(value)),0);
+        const differenceRms = Math.sqrt(differences.reduce((sum,value)=>sum+value*value,0)/differences.length);
+        const signalRms = Math.sqrt(normalMidi.reduce((sum,value)=>sum+value*value,0)/normalMidi.length);
+        results.textContent += `Hold comparison: peak difference ${differencePeak}, RMS difference ${differenceRms}\n`;
+        // Separate Web Audio renders may differ by one Float32 ULP after the
+        // WaveShaper. Reject timing/envelope changes, allowing only numeric noise.
+        check(differencePeak < 1e-6 && differenceRms < signalRms * 1e-5,
+          'Hold ON/OFF preserve imported MIDI/drum waveforms within Float32 tolerance');
         setHold(false);
         Tone.start = originalStart;
         await startTransport();
         await pause(200);
         await noteOn('validation:shared', 12);
         await pause(600);
-        check(!midiPitchCounts.has(60) && soundingNotes.has(60) && document.querySelectorAll('.piano-key.is-active').length >= 1, 'manual C4 remains held after overlapping MIDI C4 notes end');
+        check(!midiPitchCounts.has(60) && soundingNotes.has(60) && document.querySelectorAll('.piano-key.is-active').length >= 1, `manual C4 remains held after overlapping MIDI C4 notes end (state=${transportState}, ticks=${Tone.getTransport().ticks}, manual=${soundingNotes.has(60)}, MIDI=${midiPitchCounts.get(60) || 0})`);
         noteOff('validation:shared');
         await pause(800);
         check(midiVisualNotes.size === 0 && document.querySelectorAll('.piano-key.is-active').length === 0, 'MIDI note endings release every visual key');

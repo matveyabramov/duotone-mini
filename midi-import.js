@@ -4,6 +4,8 @@
 let importedMidi = null;
 let midiPart = null;
 let importRequest = 0;
+let midiEndEvent = null;
+let midiEndTick = null;
 const midiPitchCounts = new Map();
 const midiVisualNotes = new Map();
 
@@ -39,6 +41,9 @@ function parseMidi(buffer, filename) {
     filename, trackName: selected.track.name || `Track ${selected.index + 1}`,
     trackIndex: selected.index, channel: selected.track.channel, ppq: parsed.header.ppq,
     tempo: tempos[0]?.bpm ?? null, tempoChanges: tempos.length,
+    // The last attack may be short while an earlier note is still held.
+    endTicks: Math.max(...selected.notes.map(note => note.ticks + note.durationTicks)),
+    endTime: Math.max(...selected.notes.map(note => note.time + note.duration)),
     notes: selected.notes.map((note, id) => ({ id, midi: note.midi, ticks: note.ticks,
       durationTicks: note.durationTicks, time: note.time, duration: note.duration,
       velocity: Math.min(1, note.velocity) }))
@@ -85,14 +90,22 @@ function scheduleMidi(generation, transport) {
     events.push({ time: `${tick}i`, tick, on: true, note });
     events.push({ time: `${end}i`, tick: end, on: false, note });
   }
+  midiEndTick = Math.max(...events.filter(event => !event.on).map(event => event.tick));
   // Release before a new attack at an equal tick; overlapping pitches use counts.
   events.sort((a, b) => a.tick - b.tick || Number(a.on) - Number(b.on));
   midiPart = new Tone.Part((time, event) => playMidiEvent(event, time, generation), events).start(0);
   midiPart.loop = false;
+  // Tick timing follows the same BPM/PPQ mapping as the notes, including live BPM edits.
+  // Audio work uses the callback's time; UI work waits for Draw's audible time.
+  midiEndEvent = transport.scheduleOnce(time => {
+    if (generation !== transportGeneration || transportState !== 'playing') return;
+    finishComposition(time, generation, transport);
+  }, `${midiEndTick}i`);
 }
 function playMidiEvent(event, time, generation) {
   if (generation !== transportGeneration || transportState !== 'playing') return;
   const { note, on } = event;
+  lastScheduledAudioTime = Math.max(lastScheduledAudioTime, time);
   const count = midiPitchCounts.get(note.midi) || 0;
   // Sharing one gate for an overlapping pitch prevents a MIDI note-off from
   // cutting a manually held note (and vice versa) within this one PolySynth.
@@ -107,19 +120,34 @@ function playMidiEvent(event, time, generation) {
     }
   }
   Tone.getDraw().schedule(() => {
-    if (generation !== transportGeneration || transportState !== 'playing') return;
-    if (on) {
-      midiVisualNotes.set(note.id, note.midi);
-      lastNote = `MIDI ${noteName(note.midi)}`;
-      display();
-    } else midiVisualNotes.delete(note.id);
+    if (generation !== transportGeneration || !['playing', 'finishing'].includes(transportState)) return;
+    if (on) midiVisualNotes.set(note.id, note.midi);
+    else midiVisualNotes.delete(note.id);
+    updateMidiReadout();
     refreshKeys();
   }, time);
 }
-function clearMidiPlayback() {
+function updateMidiReadout() {
+  const pitches = [...new Set(midiVisualNotes.values())].sort((a, b) => a - b);
+  if (pitches.length) lastNote = `MIDI ${pitches.map(noteName).join(' + ')}`;
+  else lastNote = 'MIDI RELEASE / FX';
+  display();
+}
+function refreshMidiRange() {
+  const low = 48 + octave * 12, high = low + 24;
+  const pitches = [...new Set(midiVisualNotes.values())].sort((a, b) => a - b);
+  const outside = pitches.filter(midi => midi < low || midi > high);
+  // Reuse the approved range label: no new controls or layout changes.
+  document.getElementById('keyboard-range').textContent = `25 KEYS · ${noteName(low)}–${noteName(high)}` +
+    (outside.length ? ` · MIDI ${outside.slice(0, 3).map(midi => `${noteName(midi)} ${midi < low ? '↓ BELOW' : '↑ ABOVE'}`).join(' / ')}${outside.length > 3 ? ` +${outside.length - 3}` : ''}` : '');
+}
+function clearMidiPlayback(time = audio?.synth.context.immediate() ?? 0) {
+  if (midiEndEvent !== null) observedTransport?.clear(midiEndEvent);
+  midiEndEvent = null;
+  midiEndTick = null;
   midiPart?.dispose();
   midiPart = null;
-  for (const midi of midiPitchCounts.keys()) audio?.synth.triggerRelease(noteName(midi), Tone.immediate());
+  for (const midi of midiPitchCounts.keys()) audio?.synth.triggerRelease(noteName(midi), time);
   midiPitchCounts.clear();
   midiVisualNotes.clear();
   refreshKeys();

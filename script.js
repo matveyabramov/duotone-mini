@@ -12,6 +12,12 @@ const parameters = {
   release: { label: 'Release', min: .03, max: 6, value: 1.2, log: true }
 };
 const levels = { synth: 10 ** (-3 / 20), drums: 10 ** (-6 / 20), fx: .24, master: 10 ** (-1 / 20) };
+// Fixed routing: full stereo voice mixes are panned after their effect returns.
+const voiceRouting = { synthPan: -.25, drumPan: .25, drumCutoff: 18000,
+  drumQ: .5, drumRoom: .18, drumDampening: 6000, drumReturn: .04 };
+// StereoPanner adds correlated centre content toward the chosen side. This trim
+// preserves the total L/R power of a dual-mono dry source at the fixed positions.
+function panTrim(pan) { return 1 / Math.sqrt(1 + Math.sin(Math.abs(pan) * Math.PI / 2)); }
 // Local TR-909 recordings from the teacher's tutorial_4. Each mapping plays at
 // its recorded pitch; the notes remain pad metadata, independent of synth octave.
 const drumSampleBaseUrl = 'assets/audio/';
@@ -34,6 +40,11 @@ let sequence = null;
 let transportState = 'stopped';
 let transportGeneration = 0;
 let observedTransport = null;
+let lastScheduledAudioTime = 0;
+const performanceFade = .3;
+const effectFlush = .35;
+let cleanupUntil = 0;
+let cleanupTimer = null;
 const keyboardCodes = ['KeyZ','KeyS','KeyX','KeyD','KeyC','KeyV','KeyG','KeyB','KeyH','KeyN','KeyJ','KeyM','KeyQ','Digit2','KeyW','Digit3','KeyE','KeyR','Digit5','KeyT','Digit6','KeyY','Digit7','KeyU','KeyI'];
 const noteNames = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 const sources = new Map();
@@ -54,7 +65,7 @@ function noteName(midi) { return noteNames[midi % 12] + (Math.floor(midi / 12) -
 function display() {
   clearTimeout(oledTimer);
   document.getElementById('oled-voice').textContent = 'VOICE A · POLY SYNTH';
-  document.getElementById('oled-title').textContent = 'Glass Horizon';
+  document.getElementById('oled-title').textContent = importedMidi?.filename ?? 'Glass Horizon';
   readout.textContent = `${lastParameter} · ${lastNote}`;
 }
 function drumFeedback(index, status) {
@@ -80,8 +91,8 @@ function formatLevel(id) {
   return id === 'fx' ? `${Math.round(levels[id] * 100)}%` : levels[id] === 0 ? '−∞ dB' : `${(20 * Math.log10(levels[id])).toFixed(0).replace('-', '−')} dB`;
 }
 
-// Audio graph: synth → filter → synth level → dry output + two wet returns → master.
-// The synth level therefore controls both its dry sound and its effects sends.
+// Each voice sums its own dry/wet paths, then pans the complete stereo bus.
+// Synth controls its dry sound and FX inputs; Drums controls its whole dry/wet mix.
 async function ensureAudio() {
   if (!window.Tone) throw new Error('Tone.js did not load');
   if (audioStarting) return audioStarting;
@@ -89,10 +100,33 @@ async function ensureAudio() {
     await Tone.start();
     observeTransport(Tone.getTransport());
     if (!audio) {
-      const master = new Tone.Gain(levels.master).toDestination();
+      const performance = new Tone.Gain(1).toDestination();
+      // Fixed output protection: normal mixes retain their level; dense chords
+      // at maximum faders are limited before the common performance fade.
+      const outputGuard = new Tone.WaveShaper(value => {
+        const magnitude = Math.abs(value);
+        return magnitude <= .8 ? value : Math.sign(value) * (.8 + .15 * Math.tanh((magnitude - .8) / .15));
+      }, 4097).connect(performance);
+      const master = new Tone.Gain(levels.master).connect(outputGuard);
+      const synthPanner = new Tone.Panner({ pan: voiceRouting.synthPan, channelCount: 2 }).connect(master);
+      const drumPanner = new Tone.Panner({ pan: voiceRouting.drumPan, channelCount: 2 }).connect(master);
+      const synthBus = new Tone.Gain(panTrim(voiceRouting.synthPan)).connect(synthPanner);
+      const drumBus = new Tone.Gain(panTrim(voiceRouting.drumPan)).connect(drumPanner);
+      // Keep stereo effect returns intact and dry sources consistently dual-mono,
+      // even when an effect return is muted. No channel splitter or phase inversion.
+      for (const bus of [synthBus, drumBus]) {
+        bus.channelCount = 2;
+        bus.channelCountMode = 'explicit';
+      }
       const synthLevel = new Tone.Gain(levels.synth);
-      const drumLevel = new Tone.Gain(levels.drums).connect(master);
-      const fxLevel = new Tone.Gain(levels.fx).connect(master);
+      const drumLevel = new Tone.Gain(levels.drums).connect(drumBus);
+      const drumReverbReturn = new Tone.Gain(voiceRouting.drumReturn).connect(drumLevel);
+      const drumReverb = new Tone.Freeverb({ roomSize: voiceRouting.drumRoom,
+        dampening: voiceRouting.drumDampening, wet: 1 }).connect(drumReverbReturn);
+      const drumFilter = new Tone.Filter({ frequency: voiceRouting.drumCutoff,
+        type: 'lowpass', rolloff: -12, Q: voiceRouting.drumQ }).connect(drumLevel);
+      drumFilter.connect(drumReverb);
+      const fxLevel = new Tone.Gain(levels.fx).connect(synthBus);
       const reverbSend = new Tone.Gain(parameters.reverb.value).connect(fxLevel);
       const delaySend = new Tone.Gain(parameters.delay.value).connect(fxLevel);
       const reverb = new Tone.Freeverb({ roomSize: .72, dampening: 4500, wet: 1 }).connect(reverbSend);
@@ -104,10 +138,14 @@ async function ensureAudio() {
         envelope: { attack: parameters.attack.value, decay: parameters.decay.value, sustain: parameters.sustain.value, release: parameters.release.value }
       }).connect(filter);
       synth.maxPolyphony = 32;
-      synthLevel.connect(master);
+      synthLevel.connect(synthBus);
       synthLevel.connect(reverb);
       synthLevel.connect(delay);
-      audio = { synth, filter, synthLevel, drumLevel, fxLevel, reverbSend, delaySend, reverb, delay, master };
+      audio = { synth, filter, synthLevel, synthBus, synthPanner, drumFilter, drumReverb,
+        drumReverbReturn, drumLevel, drumBus, drumPanner, fxLevel, reverbSend,
+        delaySend, reverb, delay, master, outputGuard, performance };
+      cleanupUntil = 0;
+      lastScheduledAudioTime = 0;
     }
   })();
   try { await audioStarting; } finally { audioStarting = null; }
@@ -134,7 +172,7 @@ function applyLevel(id) {
 }
 
 // One single-sample Sampler per pad keeps a missing file isolated from the other
-// drums. All eight samplers share Voice B's gain, with no synth filter or FX sends.
+// drums. All eight enter Voice B's own filter; no connection to Voice A's effects.
 function loadDrum(index) {
   if (drumVoices[index] && drumVoices[index].state !== 'failed') return drumVoices[index];
   drumVoices[index]?.sampler?.dispose();
@@ -161,7 +199,7 @@ function loadDrum(index) {
         volume: -6,
         onload: () => finish(true),
         onerror: () => finish(false)
-      }).connect(audio.drumLevel);
+      }).connect(audio.drumFilter);
     } catch { finish(false); }
   });
   return voice;
@@ -185,6 +223,8 @@ async function triggerDrum(index) {
   const generation = drumGeneration;
   try {
     await ensureAudio();
+    if (generation !== drumGeneration) return;
+    await waitForAudioCleanup();
     if (generation !== drumGeneration) return;
     const voice = loadDrum(index);
     if (voice.state === 'loading') drumFeedback(index, 'LOADING SAMPLE');
@@ -214,13 +254,13 @@ function releasePad(index, token, cancelled = false) {
   }
   refreshPad(index);
 }
-function stopDrums() {
+function stopDrums(time = audio?.synth.context.immediate() ?? 0) {
   drumGeneration++;
   for (let index = 0; index < padStates.length; index++) {
     clearTimeout(padStates[index].timer);
     padStates[index].pressed.clear();
     padStates[index].flashing = false;
-    drumVoices[index]?.sampler?.releaseAll(Tone.immediate());
+    drumVoices[index]?.sampler?.releaseAll(time);
     refreshPad(index);
   }
   display();
@@ -231,16 +271,90 @@ function stopDrums() {
 function playDrum(index, time, velocity = .9, playbackGeneration = null) {
   const voice = drumVoices[index];
   if (voice?.state !== 'ready') return;
+  lastScheduledAudioTime = Math.max(lastScheduledAudioTime, time ?? Tone.now());
   voice.sampler.triggerAttack(drumSamples[index].note, time, velocity);
   const generation = drumGeneration;
   const feedback = () => {
     if (generation !== drumGeneration) return;
-    if (playbackGeneration !== null && (playbackGeneration !== transportGeneration || transportState !== 'playing')) return;
+    if (playbackGeneration !== null && (playbackGeneration !== transportGeneration || !['playing', 'finishing'].includes(transportState))) return;
     flashPad(index);
-    drumFeedback(index, 'ONE SHOT');
+    if (playbackGeneration === null || !importedMidi) drumFeedback(index, 'ONE SHOT');
   };
   if (time === undefined) feedback();
   else Tone.getDraw().schedule(feedback, time);
+}
+// A unity safety gain fades the entire dry/wet/drum mix without changing faders.
+// Flush the existing effect buffers with feedback disabled while the mix is muted.
+// All automation belongs to the graph's context (also valid during Tone.Offline).
+function silencePerformance(time) {
+  if (!audio) return;
+  const graph = audio, context = graph.synth.context;
+  const fadeEnd = time + performanceFade;
+  const ready = Math.max(fadeEnd, lastScheduledAudioTime + .02) + effectFlush;
+  if (cleanupTimer !== null) cleanupTimer.context.clearTimeout(cleanupTimer.id);
+  cleanupTimer = null;
+  cleanupUntil = ready;
+  const gain = graph.performance.gain;
+  gain.cancelAndHoldAtTime(time);
+  gain.linearRampToValueAtTime(0, fadeEnd);
+  gain.setValueAtTime(0, ready);
+  gain.linearRampToValueAtTime(1, ready + .01);
+  for (const [signal, normal] of [[graph.reverb.roomSize, .72], [graph.delay.feedback, .28],
+      [graph.drumReverb.roomSize, voiceRouting.drumRoom]]) {
+    signal.cancelScheduledValues(time);
+    signal.setValueAtTime(normal, time);
+    signal.setValueAtTime(0, fadeEnd);
+    signal.setValueAtTime(normal, ready);
+  }
+  // Lookahead may already have queued attacks after a manual Stop. Release again
+  // after every queued attack, shortening even voices already in their Release.
+  const releaseTime = Math.max(fadeEnd, lastScheduledAudioTime + .001);
+  const id = context.setTimeout(() => {
+    cleanupTimer = null;
+    if (audio !== graph) return;
+    graph.synth.set({ envelope: { release: .015 } });
+    graph.synth.releaseAll(releaseTime);
+    graph.synth.set({ envelope: { release: parameters.release.value } });
+    for (const voice of drumVoices) voice?.sampler?.releaseAll(releaseTime);
+  }, Math.max(0, releaseTime - context.now()));
+  cleanupTimer = { context, id };
+}
+async function waitForAudioCleanup() {
+  const graph = audio;
+  // Offline rendering advances audio time after the setup function has returned.
+  if (!graph || graph.synth.context.isOffline) return;
+  while (audio === graph && graph.synth.context.immediate() < cleanupUntil + .01) {
+    await new Promise(resolve => setTimeout(resolve,
+      Math.min(50, Math.max(1, (cleanupUntil + .01 - graph.synth.context.immediate()) * 1000))));
+  }
+}
+function finishComposition(time, generation, transport) {
+  // This runs in scheduler lookahead: silence is scheduled at time, never now.
+  transportState = 'finishing';
+  sequence?.stop(`${midiEndTick}i`);
+  transport.stop(time);
+  silencePerformance(time);
+  audio.synth.releaseAll(time);
+  for (const voice of drumVoices) voice?.sampler?.releaseAll(time);
+  Tone.getDraw().schedule(() => {
+    if (generation !== transportGeneration || transportState !== 'finishing') return;
+    transportGeneration++;
+    transportState = 'stopped';
+    transport.position = 0;
+    sequence?.dispose();
+    sequence = null;
+    clearMidiPlayback(time);
+    releaseAll(time);
+    stopDrums(time);
+    refreshTransport();
+    lastNote = 'FINISHED';
+    display();
+    oledTimer = setTimeout(() => {
+      if (generation + 1 !== transportGeneration || transportState !== 'stopped') return;
+      lastNote = 'READY';
+      display();
+    }, 1800);
+  }, time);
 }
 function setBpm(value) {
   const parsed = Number(value);
@@ -255,12 +369,13 @@ function setBpm(value) {
 }
 function refreshTransport() {
   const button = document.getElementById('play');
-  button.setAttribute('aria-pressed', String(observedTransport?.state === 'started'));
+  button.setAttribute('aria-pressed', String(transportState === 'playing' && observedTransport?.state === 'started'));
   button.setAttribute('aria-busy', String(transportState === 'loading'));
   button.title = transportState === 'loading' ? 'Loading groove samples…' : importedMidi ? 'Play imported melody with drums' : 'Start the four-beat drum groove';
 }
 function transportStarted() { refreshTransport(); }
 function transportStopped() {
+  if (transportState === 'finishing') return;
   if (transportState !== 'stopped') stopTransport(false);
   else refreshTransport();
 }
@@ -276,6 +391,7 @@ function observeTransport(transport) {
   refreshTransport();
 }
 async function startTransport() {
+  if (transportState === 'finishing') stopTransport();
   if (transportState !== 'stopped') return;
   const generation = ++transportGeneration;
   transportState = 'loading';
@@ -283,6 +399,9 @@ async function startTransport() {
   try {
     await ensureAudio();
     if (generation !== transportGeneration) return;
+    await waitForAudioCleanup();
+    if (generation !== transportGeneration) return;
+    lastScheduledAudioTime = Tone.immediate();
     const required = [0, 1, 3];
     const loaded = await Promise.all(required.map(index => loadDrum(index).ready));
     if (generation !== transportGeneration) return;
@@ -297,6 +416,7 @@ async function startTransport() {
     transport.bpm.value = bpm;
     sequence = new Tone.Sequence((time, step) => {
       if (generation !== transportGeneration || transportState !== 'playing') return;
+      if (midiEndTick !== null && transport.getTicksAtTime(time) >= midiEndTick) return;
       playDrum(3, time, step % 2 === 0 ? .55 : .4, generation);
       if (step === 0 || step === 4) playDrum(0, time, .9, generation);
       if (step === 2 || step === 6) playDrum(1, time, .85, generation);
@@ -312,24 +432,26 @@ async function startTransport() {
     display();
   }
 }
-function stopTransport(stopClock = true) {
+function stopTransport(stopClock = true, time = audio?.synth.context.immediate() ?? 0) {
   transportGeneration++;
   transportState = 'stopped';
   if (observedTransport) {
-    if (stopClock) observedTransport.stop(Tone.immediate());
+    if (stopClock) observedTransport.stop(time);
     observedTransport.position = 0;
   }
   sequence?.dispose();
   sequence = null;
-  clearMidiPlayback();
-  releaseAll();
+  silencePerformance(time);
+  clearMidiPlayback(time);
+  releaseAll(time);
   refreshTransport();
   // Cancel pending manual hits and scheduled drum tails, including lookahead hits.
-  stopDrums();
+  stopDrums(time);
 }
 
 // Track each physical source separately so simultaneous mouse/keyboard notes release safely.
 function refreshKeys() {
+  refreshMidiRange();
   for (const key of piano.children) {
     const midi = 48 + Number(key.dataset.index) + octave * 12;
     const active = [...sources.values()].some(source => source.active && source.midi === midi) ||
@@ -352,7 +474,7 @@ function unlatchNote(midi) {
 }
 async function noteOn(token, index) {
   if (sources.has(token)) return;
-  const source = { index, midi: 48 + index + octave * 12, active: true, latch: hold,
+  const source = { midi: 48 + index + octave * 12, active: true, latch: hold,
     started: false, released: false, generation: noteGeneration };
   sources.set(token, source);
   // Toggle on the press, before awaiting browser audio, so rapid startup taps
@@ -364,6 +486,7 @@ async function noteOn(token, index) {
   refreshKeys();
   try {
     await ensureAudio();
+    await waitForAudioCleanup();
     if (source.generation !== noteGeneration || !source.active) return;
     if (source.latch) {
       if (!latchedNotes.has(source.midi)) return;
@@ -371,14 +494,20 @@ async function noteOn(token, index) {
       // Preserve a quick first tap, but never cut a newer held note of this pitch.
       if (!source.released || soundingNotes.has(source.midi) ||
         [...sources.values()].some(other => other.active && other.midi === source.midi)) return;
-      if (!midiPitchCounts.has(source.midi)) audio.synth.triggerAttackRelease(noteName(source.midi), .06, undefined, .8);
+      if (!midiPitchCounts.has(source.midi)) {
+        lastScheduledAudioTime = Math.max(lastScheduledAudioTime, Tone.now() + .06);
+        audio.synth.triggerAttackRelease(noteName(source.midi), .06, undefined, .8);
+      }
       lastNote = `${noteName(source.midi)} / ${keyboardCodes[index].replace('Key', '').replace('Digit', '')}`;
       display();
       refreshKeys();
       return;
     }
     if (!soundingNotes.has(source.midi)) {
-      if (!midiPitchCounts.has(source.midi)) audio.synth.triggerAttack(noteName(source.midi), undefined, .8);
+      if (!midiPitchCounts.has(source.midi)) {
+        lastScheduledAudioTime = Math.max(lastScheduledAudioTime, Tone.now());
+        audio.synth.triggerAttack(noteName(source.midi), undefined, .8);
+      }
       soundingNotes.add(source.midi);
     }
     source.started = true;
@@ -400,15 +529,15 @@ function noteOff(token, cancelled = false) {
   }
   refreshKeys();
 }
-function releaseAll() {
+function releaseAll(time = audio?.synth.context.immediate() ?? 0) {
   noteGeneration++;
   sources.clear();
   latchedNotes.clear();
   for (const midi of soundingNotes) {
-    if (!midiPitchCounts.has(midi)) audio?.synth.triggerRelease(noteName(midi), Tone.immediate());
+    if (!midiPitchCounts.has(midi)) audio?.synth.triggerRelease(noteName(midi), time);
   }
   soundingNotes.clear();
-  if (!midiPitchCounts.size) audio?.synth.releaseAll(Tone.immediate());
+  if (!midiPitchCounts.size) audio?.synth.releaseAll(time);
   refreshKeys();
 }
 function setHold(value) {
@@ -528,6 +657,8 @@ for (const id of ['synth','drums','fx','master']) {
   fader.style.setProperty('--level', levels[id]);
   document.getElementById('faders').append(fader);
   const input = fader.querySelector('input');
+  input.title = { synth: 'Voice A level and input to its effects', drums: 'Voice B drums and reverb',
+    fx: 'Voice A reverb and delay only', master: 'Overall instrument level' }[id];
   input.setAttribute('aria-valuetext', formatLevel(id));
   input.addEventListener('input', () => {
     levels[id] = Number(input.value) / 100;
@@ -584,9 +715,6 @@ window.addEventListener('keydown', event => {
 window.addEventListener('keyup', event => noteOff(`keyboard:${event.code}`));
 window.addEventListener('pointerup', event => noteOff(`pointer:${event.pointerId}`));
 window.addEventListener('pointercancel', event => noteOff(`pointer:${event.pointerId}`, true));
-window.addEventListener('blur', releaseAll);
-document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
-window.addEventListener('pagehide', releaseAll);
 holdButton.addEventListener('click', () => { setHold(!hold); ensureAudio().catch(audioError); });
 document.getElementById('oct-down').addEventListener('click', () => changeOctave(-1));
 document.getElementById('oct-up').addEventListener('click', () => changeOctave(1));
@@ -608,6 +736,6 @@ document.getElementById('import').addEventListener('click', () => {
 midiFileInput.addEventListener('change', () => importMidiFile(midiFileInput.files[0]));
 
 // Drum lifecycle is separate: octave and Hold continue to affect only Voice A.
-window.addEventListener('blur', stopTransport);
+window.addEventListener('blur', () => stopTransport());
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopTransport(); });
-window.addEventListener('pagehide', stopTransport);
+window.addEventListener('pagehide', () => stopTransport());

@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><base href="../"><title>DUOTONE MINI playback validation</title>
+  <script src="assets/vendor/Tone.js"></script><script src="assets/vendor/Midi.js"></script>
+  <script src="midi-import.js"></script>
+</head>
+<body>
+  <h1>DUOTONE MINI playback validation</h1>
+  <button id="run" disabled>Run completion and visual checks</button>
+  <pre id="results">Loading…</pre>
+  <details><summary>Instrument during live checks</summary><div id="fixture"></div></details>
+  <script>
+    const results = document.getElementById('results');
+    // Audio devices/contexts can advance slower than wall time; inspect musical time.
+    async function pause(ms) {
+      const context = Tone.getContext(), start = context.immediate(), deadline = performance.now() + ms + 15000;
+      while (context.immediate() - start < ms / 1000) {
+        if (performance.now() > deadline) throw Error('Audio clock did not advance; keep this test tab active');
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+    }
+    let uncaught = 0;
+    let polyphonyDrops = 0;
+    let timingWarnings = 0;
+    window.addEventListener('error', () => uncaught++);
+    window.addEventListener('unhandledrejection', () => uncaught++);
+    function check(ok, label) { if (!ok) throw Error(label); results.textContent += `PASS: ${label}\n`; }
+    function disposeGraph() {
+      stopTransport();
+      for (const voice of drumVoices) voice?.sampler?.dispose();
+      drumVoices.length = 0;
+      if (audio) for (const node of Object.values(audio)) node.dispose();
+      audio = null; audioStarting = null;
+    }
+    const rms = (samples, start, end) => Math.sqrt(samples.slice(Math.floor(start * 44100), Math.floor(end * 44100))
+      .reduce((sum, value) => sum + value * value, 0) / Math.floor((end - start) * 44100));
+    async function fixtureFile(name) {
+      return new File([await (await fetch(`tests/fixtures/${name}`)).arrayBuffer()], name);
+    }
+    function testMidi() {
+      const midi = new Midi(); midi.header.setTempo(120);
+      const track = midi.addTrack(); track.name = 'Completion and ownership';
+      for (const [midi, time, duration] of [[60,0,1.5], [64,0,.4], [67,0,.4],
+          [60,.2,.5], [36,.35,.35], [84,.8,.3], [72,1.1,.1]]) {
+        track.addNote({midi, time, duration, velocity:.8});
+      }
+      return new File([midi.toArray()], 'completion.mid');
+    }
+    async function renderCompletion(glass = false, manualStop = false) {
+      const hits = [], on = [], off = [];
+      const release = parameters.release.value, dropsBefore = polyphonyDrops;
+      const originalHit = playDrum, originalEvent = playMidiEvent;
+      playDrum = (index, time, velocity, generation) => {
+        hits.push({index, time}); originalHit(index, time, velocity, generation);
+      };
+      playMidiEvent = (event, time, generation) => {
+        (event.on ? on : off).push({note:event.note, time}); originalEvent(event, time, generation);
+      };
+      const ppq = Tone.getTransport().PPQ;
+      const endTick = Math.max(...importedMidi.notes.map(note => Math.max(
+        Math.round(note.ticks * ppq / importedMidi.ppq) + 1,
+        Math.round((note.ticks + note.durationTicks) * ppq / importedMidi.ppq))));
+      const end = endTick / ppq * 60 / bpm;
+      try {
+        const buffer = await Tone.Offline(async context => {
+          await startTransport();
+          await startTransport();
+          audio.fxLevel.gain.value = .8;
+          audio.reverbSend.gain.value = 1;
+          audio.delaySend.gain.value = 1;
+          if (manualStop) context.transport.scheduleOnce(time => stopTransport(true, time), .4);
+        }, (manualStop ? .4 : end) + 2, 2, 44100);
+        const channels = [0,1].map(channel => buffer.get().getChannelData(channel));
+        const samples = channels[0];
+        const finish = manualStop ? .4 : end;
+        check(rms(samples, .1, .3) > .0001, `${glass ? 'Glass Horizon' : 'fixture'} produces real synth/drum audio`);
+        check(hits.every(hit => hit.time < finish + .00001), 'no scheduled drum hit at or after composition end / Stop');
+        if (!manualStop) {
+          check(on.length === importedMidi.notes.length && off.length === on.length, 'all note-on/off events occur exactly once');
+          check(Math.abs(Math.max(...off.map(event => event.time)) - end) < .00001, 'last audible MIDI note-off matches the end after Transport PPQ rounding');
+        }
+        check(channels.every(data => rms(data, finish + .31, finish + .6) === 0), 'both stereo channels are silent after the 300 ms fade');
+        const residual = Math.max(...channels.map(data => rms(data, finish + .8, finish + 1.8)));
+        check(residual < .000001, `restored output contains no Voice A/B effect or sample tail (RMS ${residual.toExponential(2)})`);
+        check(audio.performance.gain.getValueAtTime(finish + .8) === 1, 'unity safety gain automatically restores');
+        check(audio.reverb.roomSize.getValueAtTime(finish + .8) === .72 &&
+          audio.delay.feedback.getValueAtTime(finish + .8) === .28 &&
+          audio.drumReverb.roomSize.getValueAtTime(finish + .8) === voiceRouting.drumRoom, 'all Voice A/B feedback settings restore');
+        check(parameters.release.value === release && audio.synth.get().envelope.release === release, 'user ADSR is preserved after shortening only cleanup releases');
+        check(polyphonyDrops === dropsBefore, 'no synth notes are dropped within the tested performance settings');
+      } finally {
+        playDrum = originalHit; playMidiEvent = originalEvent; disposeGraph();
+      }
+    }
+    async function liveChecks() {
+      await importMidiFile(testMidi());
+      const frames = [], hits = [];
+      const originalEvent = playMidiEvent, originalHit = playDrum;
+      playMidiEvent = (event, time, generation) => {
+        originalEvent(event, time, generation);
+        Tone.getDraw().schedule(() => {
+          if (generation !== transportGeneration) return;
+          frames.push({id:event.note.id, on:event.on, midi:event.note.midi,
+            clock:audio.synth.context.immediate(), time,
+            pressed:[...piano.children].filter(key => key.getAttribute('aria-pressed') === 'true')
+              .map(key => 48 + Number(key.dataset.index) + octave * 12),
+            range:document.getElementById('keyboard-range').textContent});
+        }, time);
+      };
+      playDrum = (index,time,velocity,generation) => {
+        hits.push({index,time}); originalHit(index,time,velocity,generation);
+      };
+      try {
+        await startTransport();
+        await pause(250);
+        check(piano.children[12].getAttribute('aria-pressed') === 'true', 'live C4 is visibly held');
+        setHold(true); await noteOn('validation:shared',12); noteOff('validation:shared');
+        await pause(1450);
+        check(transportState === 'stopped' && Tone.getTransport().state === 'stopped', 'MIDI completion stops the real live Transport');
+        check(sequence === null && midiPart === null && midiEndEvent === null, 'completion disposes every owned playback event');
+        check(document.getElementById('play').getAttribute('aria-pressed') === 'false', 'Play becomes neutral at completion');
+        check(readout.textContent.includes('FINISHED'), 'brief FINISHED indication is visible');
+        check(document.getElementById('oled-title').textContent === 'completion.mid', 'OLED retains the imported filename at completion');
+        check(midiVisualNotes.size + midiPitchCounts.size + soundingNotes.size + latchedNotes.size === 0,
+          'completion clears MIDI, manual and Hold notes');
+        check(document.querySelectorAll('.piano-key.is-active,.pad.is-active').length === 0, 'no ghost keys or drum pads');
+        check(frames.every(frame => Math.abs(frame.clock-frame.time) < .05), 'every visual note event occurs within one-to-three frames of audible time');
+        check(frames.filter(frame => frame.on && frame.midi >= 48 && frame.midi <= 72)
+          .every(frame => frame.pressed.includes(frame.midi)), 'every in-range note-on activates its correct key');
+        check(frames.filter(frame => !frame.on && [64, 67, 72].includes(frame.midi))
+          .every(frame => !frame.pressed.includes(frame.midi)), 'each independent in-range note-off clears its key while Release/FX continues');
+        check(frames.some(frame => frame.on && frame.pressed.includes(60) && frame.pressed.includes(64) && frame.pressed.includes(67)), 'chord keys are simultaneously active');
+        check(frames.some(frame => !frame.on && frame.midi === 60 && frame.pressed.includes(60)), 'overlapping same-pitch / manual Hold ownership survives individual note-offs');
+        check(frames.some(frame => frame.midi === 36 && frame.on && frame.range.includes('C2 ↓ BELOW')) &&
+          frames.some(frame => frame.midi === 84 && frame.on && frame.range.includes('C6 ↑ ABOVE')), 'both off-range pitches appear at their original pitch in the existing label');
+        const count = hits.length; await pause(750);
+        check(hits.length === count, 'no drum loop continues after completion');
+        check(audio.synth.activeVoices === 0, 'cleanup leaves no active synth voices');
+        check(audio.performance.gain.value === 1, 'audio levels restored without reload');
+        setHold(false);
+        await noteOn('validation:after',12); check(soundingNotes.has(60), 'manual synth works after completion');
+        noteOff('validation:after'); await triggerDrum(2); check(drumVoices[2].state === 'ready', 'manual pads work after completion');
+        await startTransport(); await pause(220);
+        check(midiVisualNotes.size >= 3, 'new Play restarts the initial chord from the beginning');
+        stopTransport(); await pause(800);
+        check(midiVisualNotes.size === 0 && audio.synth.activeVoices === 0, 'manual Stop clears highlights and long Release voices');
+        for (let cycle=0; cycle<3; cycle++) {
+          const pending = startTransport(); stopTransport(); await pending;
+          await startTransport(); await pause(30); stopTransport();
+          await importMidiFile(testMidi());
+        }
+        await pause(900);
+        check(transportState === 'stopped' && sequence === null && midiPart === null && midiEndEvent === null &&
+          midiVisualNotes.size === 0 && audio.synth.activeVoices === 0, 'rapid Play/Stop and re-import produce no duplicate events or stuck notes');
+      } finally { playMidiEvent=originalEvent; playDrum=originalHit; }
+    }
+    async function runChecks() {
+      document.getElementById('run').disabled = true; results.textContent = '';
+      const originalStart = Tone.start;
+      const originalWarn = console.warn;
+      polyphonyDrops = 0;
+      timingWarnings = 0;
+      console.warn = (...args) => {
+        if (args.join(' ').includes('Max polyphony exceeded')) polyphonyDrops++;
+        if (args.join(' ').includes('Events scheduled inside')) timingWarnings++;
+        originalWarn.apply(console,args);
+      };
+      const originalRelease = parameters.release.value;
+      try {
+        await originalStart(); Tone.start = () => Promise.resolve();
+        parameters.release.value = 6;
+        await importMidiFile(testMidi());
+        check(importedMidi.endTime === 1.5 && importedMidi.endTicks === 1440, 'known final note-off outlasts the last note-on');
+        await renderCompletion();
+        await renderCompletion(false,true);
+        await importMidiFile(await fixtureFile('glass-horizon.mid'));
+        check(importedMidi.notes.length === 81 && importedMidi.endTime === 40, '40-second MIDI fixture: 81 notes, 40 seconds, 96 BPM');
+        await renderCompletion(true);
+        await importMidiFile(await fixtureFile('glass-horizon-full.mid'));
+        check(importedMidi.notes.length === 481 && Math.abs(importedMidi.endTime - 119.75) < .000001,
+          'additional long regression MIDI: 481 notes, 119.75 seconds');
+        // The dense long fixture uses normal performance release. Maximum 6 s
+        // release/FX cleanup is already checked on the fixture and 40 s material.
+        parameters.release.value = originalRelease;
+        await renderCompletion(true);
+        parameters.release.value = 6;
+        Tone.start = originalStart;
+        await liveChecks();
+        check(uncaught === 0, 'no browser errors or unhandled rejections');
+        if (timingWarnings) results.textContent += 'NOTE: Tone 15.1.22 warns internally in scheduleRepeat / _restart / getTicksAtTime; supplied callback times and rendered completion remain verified.\n';
+        results.textContent += '\nALL PLAYBACK CHECKS PASSED\n';
+      } catch(error) { results.textContent += `FAIL: ${error.stack || error.message}\n`; }
+      finally {
+        Tone.start=originalStart; console.warn=originalWarn; disposeGraph(); parameters.release.value=originalRelease;
+        document.getElementById('run').disabled = false;
+      }
+    }
+    (async () => {
+      const markup = await (await fetch('index.html')).text();
+      document.getElementById('fixture').append(new DOMParser().parseFromString(markup,'text/html').querySelector('main'));
+      const script=document.createElement('script'); script.src='script.js';
+      script.onload=()=> {document.getElementById('run').disabled=false; results.textContent='Ready. Renders audio offline, then checks live visual timing.\n';};
+      document.body.append(script); document.getElementById('run').addEventListener('click',runChecks);
+    })();
+  </script>
+</body>
+</html>

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <base href="/">
+  <base href="../">
   <title>DUOTONE MINI audio validation</title>
   <script src="assets/vendor/Tone.js"></script>
   <script src="assets/vendor/Midi.js"></script>
@@ -37,27 +37,103 @@
       audio = null;
       audioStarting = null;
     }
-    async function render({ pad = null, melody = false, synthGain = .7, drumGain = .5, masterGain = .8, fxGain = 0, repeats = false } = {}) {
+    async function render({ pad = null, melody = false, synthGain = .7, drumGain = .5, masterGain = .8,
+        fxGain = 0, repeats = false, stereo = false, synthPan = voiceRouting.synthPan,
+        drumPan = voiceRouting.drumPan, drumReturn = voiceRouting.drumReturn,
+        drumCutoff = voiceRouting.drumCutoff, bypassDrumProcessing = false,
+        wetOnly = false, chord = null, cutoff = parameters.cutoff.value,
+        envelope = null, reverbReturn = parameters.reverb.value, delayReturn = parameters.delay.value } = {}) {
       const buffer = await Tone.Offline(async () => {
         await ensureAudio();
         audio.synthLevel.gain.value = synthGain;
         audio.drumLevel.gain.value = drumGain;
         audio.master.gain.value = masterGain;
         audio.fxLevel.gain.value = fxGain;
+        audio.synthPanner.pan.value = synthPan;
+        audio.drumPanner.pan.value = drumPan;
+        audio.synthBus.gain.value = panTrim(synthPan);
+        audio.drumBus.gain.value = panTrim(drumPan);
+        audio.drumReverbReturn.gain.value = drumReturn;
+        audio.drumFilter.frequency.value = drumCutoff;
+        audio.filter.frequency.value = cutoff;
+        audio.reverbSend.gain.value = reverbReturn;
+        audio.delaySend.gain.value = delayReturn;
+        if (envelope) audio.synth.set({envelope});
+        if (wetOnly) {
+          audio.synthLevel.disconnect(audio.synthBus);
+          audio.drumFilter.disconnect(audio.drumLevel);
+        }
         if (melody) audio.synth.triggerAttackRelease('C4', .25, 0, .8);
+        if (chord) audio.synth.triggerAttackRelease(chord, .25, 0, 1);
         if (pad !== null) {
           const voice = loadDrum(pad);
           check(await voice.ready, `${drumSamples[pad].name} loads and decodes`);
+          if (bypassDrumProcessing) {
+            voice.sampler.disconnect(audio.drumFilter);
+            voice.sampler.connect(audio.drumLevel);
+          }
           voice.sampler.triggerAttack(drumSamples[pad].note, 0, .9);
           if (repeats) {
             voice.sampler.triggerAttack(drumSamples[pad].note, .1, .9);
             voice.sampler.triggerAttack(drumSamples[pad].note, .2, .9);
           }
         }
-      }, 1.5, 1, 44100);
-      const samples = buffer.get().getChannelData(0).slice();
+      }, 1.5, stereo ? 2 : 1, 44100);
+      const samples = stereo ? [0,1].map(channel => buffer.get().getChannelData(channel).slice())
+        : buffer.get().getChannelData(0).slice();
       disposeGraph();
       return samples;
+    }
+    async function checkStereoAndProcessing() {
+      const power = channels => channels.reduce((sum, data) => sum + rms(data) ** 2, 0);
+      const mono = channels => channels[0].map((value, i) => (value + channels[1][i]) / 2);
+      for (const [name, settings, direction] of [
+        ['Voice A dry', {melody:true}, -1], ['Voice B dry/wet', {pad:1}, 1],
+        ['Voice A FX only', {melody:true, fxGain:.7, wetOnly:true}, -1],
+        ['Voice B reverb only', {pad:1, wetOnly:true}, 1]
+      ]) {
+        const channels = await render({...settings, stereo:true});
+        const left = rms(channels[0]), right = rms(channels[1]);
+        const centre = await render({...settings, stereo:true, synthPan:0, drumPan:0});
+        const shift = (left / right) / (rms(centre[0]) / rms(centre[1]));
+        check(left > .000001 && right > .000001, `${name} remains present in both L/R channels`);
+        // Stereo reverbs can have an unequal native L/R energy distribution.
+        // Compare the direction against that same return centred, not against mono.
+        check(direction < 0 ? shift > 1.1 : shift < .9,
+          `${name} follows its complete voice bus pan (L/R shift ${shift.toFixed(3)})`);
+        check(rms(mono(channels)) > Math.sqrt(power(channels) / 2) * .5, `${name} survives mono summing without phase cancellation`);
+        if (!settings.wetOnly) {
+          check(Math.abs(power(channels) / power(centre) - 1) < .03, `${name} stereo power stays within 3% of centre routing`);
+        }
+      }
+      for (const pad of [0,1]) {
+        const original = await render({pad, bypassDrumProcessing:true});
+        const processed = await render({pad});
+        const n = Math.floor(.1 * 44100);
+        let dot=0, rawPower=0, processedPower=0;
+        for (let i=0;i<n;i++) {dot+=original[i]*processed[i];rawPower+=original[i]**2;processedPower+=processed[i]**2;}
+        const correlation = dot / Math.sqrt(rawPower * processedPower);
+        check(correlation > .95 && rms(processed,0,n) / rms(original,0,n) > .85,
+          `${drumSamples[pad].name} keeps its original transient (correlation ${correlation.toFixed(3)})`);
+      }
+      const dry = await render({pad:1, drumReturn:0});
+      const wet = await render({pad:1});
+      check(wet.some((value,i) => Math.abs(value-dry[i]) > .000001), 'dedicated Voice B reverb produces a real independent wet return');
+      const filtered = await render({pad:1, drumReturn:0, drumCutoff:500});
+      const difference = data => data.slice(1).map((value,i) => value-data[i]);
+      const highFrequencyRatio = rms(difference(filtered)) / rms(difference(dry));
+      check(highFrequencyRatio < .7,
+        `Voice B low-pass attenuates high-frequency energy (difference RMS ratio ${highFrequencyRatio.toFixed(3)})`);
+      const closedSynth = await render({melody:true, cutoff:80});
+      const openSynth = await render({melody:true, cutoff:16000});
+      check(rms(openSynth) > rms(closedSynth) * 2, 'Voice A cutoff changes the actual rendered spectrum/level');
+      const shortEnvelope = await render({melody:true, envelope:{attack:.002,decay:.02,sustain:0,release:.03}});
+      check(rms(shortEnvelope,22050) < .000001, 'short ADSR produces no sustained synth tail');
+      const chord = Array.from({length:25},(_,i)=>noteName(48+i));
+      const mix = await render({pad:1, chord, stereo:true, synthGain:1, drumGain:1, masterGain:1,
+        fxGain:1, reverbReturn:1, delayReturn:1});
+      const peak = Math.max(...mix.map(data => data.reduce((max,value)=>Math.max(max,Math.abs(value)),0)));
+      check(Number.isFinite(peak) && peak < 1, `25-note chord plus drums at maximum faders stays below digital full scale (peak ${peak.toFixed(3)})`);
     }
     async function renderGroove(tempo, changeTempo = false) {
       const hits = [];
@@ -158,6 +234,7 @@
         check(rms(await render({ pad: 0, melody: true, masterGain: 0 })) === 0, 'Master fully mutes both voices');
         const repeated = await render({ pad: 0, repeats: true });
         check(rms(repeated, 8820, 11025) > .0001, 'rapid retriggering produces the third kick');
+        await checkStereoAndProcessing();
         await renderGroove(120);
         await renderGroove(180);
         await renderGroove(120, true);

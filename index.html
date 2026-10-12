@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#e5e7e3">
   <title>DUOTONE MINI</title>
-  <link rel="stylesheet" href="reset.css">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="css/reset.css">
+  <link rel="stylesheet" href="css/style.css">
   <script src="assets/vendor/Tone.js" defer></script>
   <script src="assets/vendor/Midi.js" defer></script>
   <script src="midi-import.js" defer></script>
@@ -28,7 +28,7 @@
       </div>
       <div class="status"><label for="bpm">BPM</label><input id="bpm" type="number" min="50" max="200" step="1" value="120.0" aria-label="Tempo in beats per minute" title="Edit tempo or use arrow keys (50–200 BPM)"></div>
       <div class="status"><span>OCTAVE</span><output id="octave">±0</output></div>
-      <div class="import-area"><span>MIDI / AUDIO</span><button id="import" class="import-button" title="Import a MIDI melody (.mid or .midi)"><img src="assets/ui/indicator.svg" width="6" height="6" alt="">IMPORT</button><input id="midi-file" type="file" accept=".mid,.midi" hidden aria-label="Choose a MIDI file"></div>
+      <div class="import-area"><span>MIDI IMPORT</span><button id="import" class="import-button" title="Import a MIDI melody (.mid or .midi)"><img src="assets/ui/indicator.svg" width="6" height="6" alt="">IMPORT</button><input id="midi-file" type="file" accept=".mid,.midi" hidden aria-label="Choose a MIDI file"></div>
     </header>
     <div class="panel-seam"></div>
     <div class="control-deck">

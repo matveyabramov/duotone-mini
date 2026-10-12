@@ -46,9 +46,22 @@ const calls = [];
 class Signal {
   constructor(value) { this.value = value; }
   rampTo(value) { this.value = value; }
+  cancelAndHoldAtTime(time) { (this.automation ??= []).push(['hold', time]); }
+  cancelScheduledValues(time) { (this.automation ??= []).push(['cancel', time]); }
+  setValueAtTime(value, time) { (this.automation ??= []).push(['set', value, time]); }
+  linearRampToValueAtTime(value, time) { (this.automation ??= []).push(['ramp', value, time]); }
 }
+const audioTimers = new Map();
+let timerId = 0;
+const audioContext = { isOffline: true, now: () => 0, immediate: () => 0,
+  setTimeout(fn, delay) { const id = ++timerId; audioTimers.set(id, { fn, delay }); return id; },
+  clearTimeout(id) { audioTimers.delete(id); }
+};
 class AudioNode {
   constructor(options) {
+    this.context = audioContext;
+    this.roomSize = new Signal(options?.roomSize);
+    this.feedback = new Signal(options?.feedback);
     this.options = options;
     this.connections = [];
     this.gain = new Signal(typeof options === 'number' ? options : 1);
@@ -65,6 +78,9 @@ class PolySynth extends AudioNode {
   triggerAttackRelease(note, duration) { calls.push(['tap', note, duration]); }
   releaseAll() { calls.push(['releaseAll']); }
   set(options) { this.options.envelope = { ...this.options.envelope, ...options.envelope }; }
+}
+class Panner extends AudioNode {
+  constructor(options) { super(options); this.pan = new Signal(options.pan); }
 }
 const drumCalls = [];
 const samplerNodes = [];
@@ -84,6 +100,10 @@ class Sampler extends AudioNode {
   dispose() { this.disposed = true; }
 }
 const transport = { bpm: { value: 120 }, PPQ: 192, state: 'stopped', starts: 0, stops: 0, events: {},
+  getTicksAtTime() { return 0; },
+  scheduled: new Map(), nextId: 0,
+  scheduleOnce(callback, time) { const id = ++this.nextId; this.scheduled.set(id, {callback, time}); return id; },
+  clear(id) { this.scheduled.delete(id); },
   on(name, callback) { (this.events[name] ??= new Set()).add(callback); },
   off(name, callback) { this.events[name]?.delete(callback); },
   start() { this.starts++; this.state = 'started'; for (const fn of this.events.start ?? []) fn(); },
@@ -105,10 +125,10 @@ class Part extends Sequence {
   constructor(callback, events) { super(callback, events); parts.push(this); }
 }
 const Tone = {
-  getTransport: () => transport, Sequence, Part, immediate: () => 0,
+  getTransport: () => transport, Sequence, Part, immediate: () => 0, now: () => 0,
   getDraw: () => ({ schedule: callback => drawQueue.push(callback) }),
   start: () => new Promise(resolve => { resume = resolve; }),
-  Gain: AudioNode, Filter: AudioNode, Freeverb: AudioNode, FeedbackDelay: AudioNode,
+  Gain: AudioNode, Filter: AudioNode, Freeverb: AudioNode, FeedbackDelay: AudioNode, Panner, WaveShaper: AudioNode,
   PolySynth, Synth: AudioNode, Sampler
 };
 window.Tone = Tone;
@@ -183,22 +203,37 @@ const assertClean = () => assert.equal(run('sources.size + soundingNotes.size + 
   assert.equal(run('audio.synthLevel.gain.value'), 0);
   assert.equal(run('audio.fxLevel.gain.value'), 0);
   assert.equal(run('audio.master.gain.value'), 0);
-  assert.equal(run('audio.synthLevel.connections.includes(audio.master)'), true);
+  assert.equal(run('audio.synthLevel.connections.includes(audio.synthBus)'), true);
   assert.equal(run('audio.synthLevel.connections.includes(audio.reverb)'), true);
   assert.equal(run('audio.synthLevel.connections.includes(audio.delay)'), true);
-  assert.equal(run('audio.fxLevel.connections.includes(audio.master)'), true);
+  assert.equal(run('audio.fxLevel.connections[0] === audio.synthBus'), true);
+  assert.equal(run('audio.synthPanner.pan.value'), -.25);
+  assert.equal(run('audio.drumPanner.pan.value'), .25);
+  assert.equal(run('audio.synthPanner.options.channelCount'), 2);
+  assert.equal(run('audio.drumPanner.options.channelCount'), 2);
+  for (const [node, targets] of Object.entries({
+    synthBus: ['synthPanner'], synthPanner: ['master'], drumBus: ['drumPanner'],
+    drumPanner: ['master'], drumLevel: ['drumBus'], drumFilter: ['drumLevel','drumReverb'],
+    drumReverb: ['drumReverbReturn'], drumReverbReturn: ['drumLevel'], master: ['outputGuard'], outputGuard: ['performance']
+  })) {
+    assert.equal(run(`audio.${node}.connections.length`), targets.length);
+    for (const target of targets) assert.equal(run(`audio.${node}.connections.includes(audio.${target})`), true);
+  }
+  assert.equal(run('audio.performance.destination'), true);
+  assert.equal(run('audio.drumFilter.options.frequency'), 18000);
+  assert.equal(run('audio.drumReverbReturn.gain.value'), .04);
   console.log('PASS: 25 mappings, repeat suppression, chords, overlapping inputs, Hold, octave, blur, pointer cancellation, startup races, 8 parameters, and 3 mixer routes.');
   // Drum-only first interaction reuses initialization, with its own master input.
   run('audio = null');
   await run('triggerDrum(0)');
   assert.equal(drumCalls.at(-1), 'C1');
   assert.equal(run('audio.drumLevel.connections.length'), 1);
-  assert.equal(run('audio.drumLevel.connections[0] === audio.master'), true);
+  assert.equal(run('audio.drumLevel.connections[0] === audio.drumBus'), true);
   for (let index = 1; index < 8; index++) await run(`triggerDrum(${index})`);
   assert.equal(new Set(drumCalls).size, 8);
   assert.equal(samplerNodes.length, 8);
   assert.equal(samplerNodes.every(node => node.connections.length === 1), true);
-  assert.equal(run('drumVoices.every(voice => voice.sampler.connections[0] === audio.drumLevel)'), true);
+  assert.equal(run('drumVoices.every(voice => voice.sampler.connections[0] === audio.drumFilter)'), true);
   // Real pointer events: press, release, cancellation, and ghost-click suppression.
   const pad = elements.pads.children[1];
   const beforePad = drumCalls.length;
@@ -321,7 +356,7 @@ const assertClean = () => assert.equal(run('sources.size + soundingNotes.size + 
   await run('startTransport()'); assert.equal(transport.starts, starts + 1);
   window.fire('blur'); assert.equal(run('sequence'), null);
   assertClean();
-  const css = fs.readFileSync('style.css', 'utf8');
+  const css = fs.readFileSync('css/style.css', 'utf8');
   assert.ok(!css.includes('.pad:first-child'));
   assert.ok(css.includes('button:focus-visible'));
   console.log('PASS: neutral pads, transient manual/sequence flashes, groove hit counts, duplicate Play guard, live instruments, BPM/range/arrows, Stop cleanup, preserved Hold, loading cancellation, and restart.');
@@ -405,10 +440,16 @@ const assertClean = () => assert.equal(run('sources.size + soundingNotes.size + 
   const samePitch = overlapPart.events.filter(event => event.note.midi === 60);
   overlapPart.callback(0, samePitch[0]); overlapPart.callback(.2, samePitch[1]);
   assert.equal(run('midiPitchCounts.get(60)'), 2);
+  drawQueue.splice(0).forEach(fn => fn());
+  assert.equal(elements.piano.children[12].attributes['aria-pressed'], 'true');
   const beforeFirstOff = calls.length;
   overlapPart.callback(.4, samePitch[2]); assert.equal(calls.length, beforeFirstOff);
   assert.equal(run('midiPitchCounts.get(60)'), 1);
+  drawQueue.splice(0).forEach(fn => fn());
+  assert.equal(elements.piano.children[12].attributes['aria-pressed'], 'true');
   overlapPart.callback(.6, samePitch[3]); assert.deepEqual(calls.at(-1), ['release', 'C4']);
+  drawQueue.splice(0).forEach(fn => fn());
+  assert.equal(elements.piano.children[12].attributes['aria-pressed'], 'false');
   run('stopTransport()'); drawQueue.splice(0).forEach(fn => fn()); assertClean();
   assert.equal(run('midiVisualNotes.size'), 0);
   // True manual latch: build C/E/G, then independently toggle C and E off.
@@ -523,9 +564,84 @@ const assertClean = () => assert.equal(run('sources.size + soundingNotes.size + 
   context.file = fixture('replacement.midi'); await run('importMidiFile(file)');
   finishFile(await fixture('melody.mid').arrayBuffer()); await pendingImport;
   assert.equal(run('importedMidi.filename'), 'replacement.midi');
-  const css4 = fs.readFileSync('style.css', 'utf8');
+  const css4 = fs.readFileSync('css/style.css', 'utf8');
   assert.ok(!css4.includes('.play-button img'));
   assert.ok(!css4.includes('#stop[aria-pressed'));
   console.log('PASS: real MIDI parsing, melodic track selection, initial/missing tempo, tick scheduling, key highlights, out-of-range audio, shared manual/MIDI pitches, octave independence, external stop/pause, restart, replacement, invalid files, overlaps, and import races.');
+
+  // Completion is the latest OFF, even when an earlier note outlasts the last ON.
+  run(`importedMidi = { filename: 'end.mid', ppq: 480, tempo: 120, notes: [
+    { id: 0, midi: 60, ticks: 0, durationTicks: 1440, velocity: .8 },
+    { id: 1, midi: 36, ticks: 480, durationTicks: 240, velocity: .8 },
+    { id: 2, midi: 84, ticks: 960, durationTicks: 120, velocity: .8 }
+  ] }; setBpm(120)`);
+  await run('startTransport()');
+  assert.equal(run('midiEndTick'), 576);
+  assert.equal(transport.scheduled.size, 1);
+  const completion = [...transport.scheduled.values()][0];
+  assert.equal(completion.time, '576i');
+  const finalPart = parts.at(-1), finalGroove = run('sequence');
+  const finalGeneration = run('transportGeneration');
+  for (const event of finalPart.events.filter(event => event.on)) finalPart.callback(event.tick / 384, event);
+  assert.ok(calls.some(call => call[0] === 'attack' && call[1] === 'C2'));
+  assert.ok(calls.some(call => call[0] === 'attack' && call[1] === 'C6'));
+  // No highlights before Draw (scheduler lookahead is not audible time).
+  assert.equal(run('midiVisualNotes.size'), 0);
+  drawQueue.splice(0).forEach(fn => fn());
+  assert.equal(elements.piano.children[12].attributes['aria-pressed'], 'true');
+  assert.match(elements['keyboard-range'].textContent, /C2 ↓ BELOW.*C6 ↑ ABOVE/);
+  const usefulReadout = elements.readout.textContent;
+  finalGroove.callback(1, 0); drawQueue.splice(0).forEach(fn => fn());
+  assert.equal(elements.readout.textContent, usefulReadout);
+  assert.equal(elements['oled-title'].textContent, 'end.mid');
+  for (const event of finalPart.events.filter(event => !event.on)) finalPart.callback(event.tick / 384, event);
+  completion.callback(3); // scheduler fires before the audio clock reaches 3 seconds
+  assert.equal(run('transportState'), 'finishing');
+  assert.equal(elements.play.attributes['aria-pressed'], 'true');
+  assert.equal(run('audio.performance.gain.automation.at(-4)[1]'), 3);
+  assert.deepEqual(Array.from(run('audio.performance.gain.automation.at(-3)')), ['ramp', 0, 3.3]);
+  assert.equal(elements.piano.children[12].attributes['aria-pressed'], 'true');
+  const hitsBeforeEnd = drumCalls.length;
+  finalGroove.callback(3.25, 1);
+  assert.equal(drumCalls.length, hitsBeforeEnd);
+  drawQueue.splice(0).forEach(fn => fn());
+  assert.equal(run('transportState'), 'stopped');
+  assert.equal(run('midiPart === null && sequence === null'), true);
+  assert.equal(elements.play.attributes['aria-pressed'], 'false');
+  assert.equal(run('midiVisualNotes.size + midiPitchCounts.size'), 0);
+  assert.match(elements.readout.textContent, /FINISHED/);
+  assert.equal(transport.scheduled.size, 0);
+  assertClean();
+  assert.equal(run('audio.drumReverb.roomSize.automation.some(event => event[0] === "set" && event[1] === 0)'), true);
+  assert.equal(run('audio.drumReverb.roomSize.automation.at(-1)[1]'), .18);
+  const selectedRelease = run('parameters.release.value');
+  const cleanup = [...audioTimers.values()].at(-1); cleanup.fn();
+  assert.equal(run('audio.synth.options.envelope.release'), selectedRelease);
+  await run('startTransport()');
+  assert.equal(parts.at(-1).events[0].time, '0i');
+  assert.equal(transport.scheduled.size, 1);
+  finalPart.callback(3.5, finalPart.events[0]);
+  run(`Tone.getDraw().schedule(() => {
+    if (${finalGeneration} === transportGeneration) midiVisualNotes.set(999, 60);
+  }, 3.5)`);
+  drawQueue.splice(0).forEach(fn => fn());
+  assert.equal(run('midiVisualNotes.size'), 0);
+  run('stopTransport()'); assert.equal(transport.scheduled.size, 0);
+  run('importedMidi = null'); await run('startTransport()');
+  assert.equal(transport.scheduled.size, 0); // no MIDI: the original manual loop
+  const loopHits = drumCalls.length;
+  run('sequence.callback(10, 0)'); assert.equal(drumCalls.length, loopHits + 2);
+  run('stopTransport()'); drawQueue.splice(0).forEach(fn => fn());
+  const glassPath = process.env.GLASS_HORIZON_MIDI || 'tests/fixtures/glass-horizon.mid';
+  const glass = fs.readFileSync(glassPath);
+  context.binary = glass;
+  const parsedGlass = run('parseMidi(binary, "Glass Horizon.mid")');
+  assert.equal(parsedGlass.endTicks, Math.max(...parsedGlass.notes.map(n => n.ticks + n.durationTicks)));
+  assert.equal(parsedGlass.endTime, Math.max(...parsedGlass.notes.map(n => n.time + n.duration)));
+  context.binary = fs.readFileSync('tests/fixtures/glass-horizon-full.mid');
+  const fullGlass = run('parseMidi(binary, "glass-horizon-full.mid")');
+  assert.equal(fullGlass.notes.length, 481);
+  assert.equal(fullGlass.endTime, 119.75);
+  console.log(`PASS: final note-off scheduling, audible-time UI, both out-of-range directions, drum OLED priority, whole-performance fade/completion, restored release, stale generation rejection, clean restart, manual groove, and Glass Horizon (${parsedGlass.notes.length} notes / ${parsedGlass.endTime}s).`);
 
 })().catch(error => { console.error(error); process.exitCode = 1; });
