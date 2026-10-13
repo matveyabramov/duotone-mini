@@ -2,7 +2,7 @@
 
 **Two voices. One instrument.**
 
-[Live Demo](https://matveyabramov.github.io/duotone-mini/) · [Figma](https://www.figma.com/design/KXUjSvnHLI06RCqXclXBwo/Synth?node-id=0-3) · [Performance Screencast](https://kinescope.io/rD1xFy4eTP4Q2j5CkoYqp6) · [GitHub](https://github.com/matveyabramov/duotone-mini)
+[Live Demo](https://matveyabramov.github.io/duotone-mini/) · [Figma](https://www.figma.com/design/KXUjSvnHLI06RCqXclXBwo/Synth?node-id=0-3) · [Performance Screencast](https://kinescope.io/hpDGFm1KnujkmRZbXTdxBC) · [GitHub](https://github.com/matveyabramov/duotone-mini)
 
 ![DUOTONE MINI — основной интерфейс с клавиатурой, восемью пэдами, регуляторами и микшером](docs/interface.png)
 
